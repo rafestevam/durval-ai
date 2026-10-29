@@ -1,0 +1,11 @@
+# {{ ansible_managed }}
+# Segredos vêm do ambiente (os.environ/<NOME>, definidos em {{ litellm_config_dir }}/litellm.env).
+{{ {
+  'model_list': litellm_models,
+  'mcp_servers': litellm_mcp_servers,
+  'litellm_settings': litellm_settings,
+  'general_settings': {
+    'master_key': 'os.environ/LITELLM_MASTER_KEY',
+    'database_url': 'os.environ/DATABASE_URL',
+  },
+} | to_nice_yaml(indent=2, sort_keys=false) }}

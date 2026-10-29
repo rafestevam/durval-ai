@@ -1,0 +1,21 @@
+---
+ansible-navigator:
+  ansible:
+    config:
+      path: ./ansible.cfg
+    inventory:
+      entries:
+        - ./inventory/inventory.ini
+  execution-environment:
+    enabled: true
+    container-engine: podman
+    image: ghcr.io/ansible/community-ansible-dev-tools:latest
+    pull:
+      policy: missing
+  mode: stdout
+  playbook-artifact:
+    enable: true
+    save-as: ./artifacts/{playbook_name}-artifact-{time_stamp}.json
+  logging:
+    level: warning
+    file: ./artifacts/ansible-navigator.log

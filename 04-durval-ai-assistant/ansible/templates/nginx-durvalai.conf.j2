@@ -1,0 +1,82 @@
+# {{ ansible_managed }}
+# Site do LiteLLM (Durval AI) no nginx instalado por 01-cairbar-identity-provider:
+#   {{ durvalai_mcp_path }}/        -> gateway MCP do LiteLLM ({{ litellm_root_path }}/mcp/)
+#   {{ litellm_root_path }}/   -> LiteLLM (console admin em {{ litellm_root_path }}/ui e a API que ele usa)
+# O LiteLLM roda com SERVER_ROOT_PATH={{ litellm_root_path }}: o prefixo é repassado sem alteração.
+# Log, correlation ID e snippets cairbar-*.conf vêm da base da solução 01.
+
+upstream litellm {
+    server {{ durvalai_upstream }};
+    keepalive 16;
+}
+
+# HTTP: desafio ACME e redirect para HTTPS.
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ durvalai_hostname }};
+    access_log /var/log/nginx/durvalai-access.log cairbar_json;
+
+    include snippets/cairbar-acme.conf;
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    # Sintaxe compatível com o nginx do Ubuntu 22.04/24.04 (< 1.25).
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {{ durvalai_hostname }};
+
+    ssl_certificate     {{ nginx_tls_cert }};
+    ssl_certificate_key {{ nginx_tls_key }};
+    include snippets/cairbar-tls.conf;
+{% if nginx_tls_cert.startswith("/etc/letsencrypt/") %}
+    add_header Strict-Transport-Security "max-age=31536000" always;
+{% endif %}
+
+    access_log /var/log/nginx/durvalai-access.log cairbar_json;
+    include snippets/cairbar-proxy.conf;
+
+    client_max_body_size {{ durvalai_client_max_body_size }};
+
+    # Streaming das respostas de LLM e sessões SSE/streamable HTTP do MCP.
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout {{ durvalai_proxy_read_timeout }};
+    proxy_send_timeout {{ durvalai_proxy_read_timeout }};
+
+    location = / {
+        return 302 {{ litellm_root_path }}/ui/;
+    }
+
+    # MCP servers (autenticação por chave virtual do LiteLLM: Authorization: Bearer sk-...).
+    location = {{ durvalai_mcp_path }} {
+        proxy_pass http://litellm{{ litellm_root_path }}/mcp/;
+    }
+
+    location {{ durvalai_mcp_path }}/ {
+        proxy_pass http://litellm{{ litellm_root_path }}/mcp/;
+    }
+
+    # Console admin do LiteLLM.
+    location = {{ litellm_root_path }} {
+        return 301 {{ litellm_root_path }}/ui/;
+    }
+
+    location {{ litellm_root_path }}/ {
+{% for cidr in durvalai_admin_allowed_cidrs %}
+        allow {{ cidr }};
+{% endfor %}
+{% if durvalai_admin_allowed_cidrs | length > 0 %}
+        deny all;
+{% endif %}
+        proxy_pass http://litellm;
+    }
+
+    location / {
+        return 404;
+    }
+}

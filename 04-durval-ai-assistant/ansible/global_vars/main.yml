@@ -1,0 +1,121 @@
+---
+# Variáveis compartilhadas pelos playbooks do LiteLLM (gateway de LLM e MCP do Durval AI).
+# Segredos ficam em global_vars/vault.yml (ver vault.yml.example).
+
+# ---------------------------------------------------------------------------
+# PostgreSQL compartilhado
+# ---------------------------------------------------------------------------
+# Instalado, configurado e com backup pela solução 01-cairbar-identity-provider
+# (playbooks/postgresql.yml). Versão e porta precisam ser as mesmas de lá.
+postgresql_version: 18
+postgresql_port: 5432
+postgresql_conf_dir: "/etc/postgresql/{{ postgresql_version }}/main"
+
+# Só o LiteLLM, na mesma VM, acessa o banco.
+postgresql_local_cidrs:
+  - 127.0.0.1/32
+  - ::1/128
+
+# O console admin do LiteLLM (chaves virtuais, usuários, times, gastos e MCP servers
+# cadastrados pela UI) exige banco. O nome precisa ser único no servidor compartilhado
+# (01 usa keycloak e carteirinha, 02 usa durvalcrm, 03 usa booksys).
+postgresql_databases:
+  - name: litellm
+    owner: litellm
+    password: "{{ vault_postgresql_litellm_password }}"
+    allowed_cidrs: "{{ postgresql_local_cidrs }}"
+
+# ---------------------------------------------------------------------------
+# LiteLLM standalone (playbooks/litellm.yml)
+# ---------------------------------------------------------------------------
+# Instalado com pip num virtualenv próprio (sem Docker) e executado pelo systemd.
+litellm_version: 1.105.7
+# Cliente Prisma (banco do console): mesma faixa do extra [extra-proxy] do LiteLLM.
+litellm_prisma_requirement: "prisma>=0.11.0,<1.0"
+litellm_user: litellm
+# HOME do serviço: virtualenv, cache do Prisma e arquivos da UI reescritos para o
+# SERVER_ROOT_PATH ficam aqui (o usuário do serviço precisa escrever no virtualenv).
+litellm_home: /var/lib/litellm
+litellm_venv: "{{ litellm_home }}/venv"
+litellm_config_dir: /etc/litellm
+
+# Só o nginx, na mesma VM, fala com o LiteLLM.
+litellm_host: 127.0.0.1
+litellm_port: 4000
+litellm_num_workers: 2
+
+# Todas as rotas do LiteLLM (API, console admin em <root>/ui e gateway MCP em
+# <root>/mcp) ficam sob este prefixo, que é o endpoint do console no nginx.
+litellm_root_path: /litellm
+
+litellm_db_name: litellm
+litellm_db_user: litellm
+
+# Login do console admin (usuário admin local, além da master key).
+litellm_ui_username: admin
+
+# Chaves dos provedores de LLM, gravadas em /etc/litellm/litellm.env e lidas pelo
+# config.yaml como os.environ/<NOME>. Chaves vazias são omitidas.
+litellm_provider_env:
+  ANTHROPIC_API_KEY: "{{ vault_anthropic_api_key | default('') }}"
+
+# model_list do config.yaml. Modelos também podem ser cadastrados pelo console
+# (STORE_MODEL_IN_DB): os daqui são recriados a cada execução do playbook.
+litellm_models:
+  - model_name: claude-sonnet-5-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+  - model_name: claude-haiku-5-5
+    litellm_params:
+      model: anthropic/claude-haiku-5-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+# MCP servers do Durval AI, publicados pelo gateway MCP do LiteLLM em
+# https://<durvalai_hostname><durvalai_mcp_path> (autenticação por chave virtual do LiteLLM).
+# Cada servidor a ser criado roda na VM (ex.: 127.0.0.1:8100) e entra aqui pelo nome
+# (chave do mcp_servers do config.yaml). Também podem ser cadastrados pelo console.
+# Exemplo:
+#   durval_crm:
+#     url: "http://127.0.0.1:8100/mcp"
+#     transport: http
+#     description: "Consultas ao DurvalCRM"
+litellm_mcp_servers: {}
+
+litellm_settings:
+  drop_params: true
+
+# ---------------------------------------------------------------------------
+# nginx: site do LiteLLM (playbooks/nginx.yml)
+# ---------------------------------------------------------------------------
+# O nginx é instalado por 01-cairbar-identity-provider; aqui só entra o site
+# sites-available/durvalai.conf.
+# Hostname litellm.<a-b-c-d>.nip.io montado a partir do IP do host (ansible_host).
+# Para usar outro, defina dominio_litellm no host do inventário.
+durvalai_hostname: "{{ dominio_litellm | default('litellm.' ~ (ansible_host | replace('.', '-')) ~ '.nip.io') }}"
+durvalai_upstream: "{{ litellm_host }}:{{ litellm_port }}"
+
+# Endpoints HTTPS (443):
+#   <durvalai_mcp_path>     -> gateway MCP do LiteLLM (<litellm_root_path>/mcp)
+#   <litellm_root_path>/ui  -> console admin do LiteLLM
+durvalai_mcp_path: /mcp
+
+# Redes com acesso ao console admin (allow do nginx). Vazio libera para todos;
+# o login do console continua exigido. Não se aplica ao endpoint MCP.
+durvalai_admin_allowed_cidrs: []
+
+# Respostas longas (streaming de LLM e sessões SSE do MCP).
+durvalai_proxy_read_timeout: 3600s
+durvalai_client_max_body_size: 20m
+
+# selfsigned: certificado gerado na VM (dev/testes).
+# letsencrypt: certbot (webroot compartilhado); exige o hostname apontando para a VM.
+# O Let's Encrypt limita certificados por domínio e o nip.io é compartilhado: se a
+# emissão falhar por limite, use selfsigned.
+durvalai_tls_mode: letsencrypt
+durvalai_letsencrypt_email: "cecairbarschutelgru@cecairbar.org.br"
+
+# Mesmos valores da solução 01 (keycloak_tls_dir e nginx_acme_webroot).
+nginx_tls_dir: /etc/nginx/tls
+nginx_tls_selfsigned_days: 825
+nginx_acme_webroot: /var/www/acme

@@ -1,0 +1,144 @@
+---
+# Acrescenta o site nginx_site (templates/nginx-<nginx_site>.conf.j2) ao nginx da VM, com
+# certificado próprio para nginx_site_hostname. O nginx, a base compartilhada
+# (conf.d/cairbar.conf e snippets/cairbar-*.conf) e o site do Keycloak são da solução
+# 01-cairbar-identity-provider, que precisa rodar antes; aqui só entra o arquivo do site.
+- name: Verificar base do nginx da solução 01
+  ansible.builtin.stat:
+    path: "/etc/nginx/{{ item }}"
+  loop:
+    - conf.d/cairbar.conf
+    - snippets/cairbar-tls.conf
+    - snippets/cairbar-proxy.conf
+    - snippets/cairbar-acme.conf
+  register: nginx_base
+
+- name: Exigir nginx instalado pela solução 01
+  ansible.builtin.assert:
+    that: nginx_base.results | rejectattr('stat.exists') | list | length == 0
+    fail_msg: >-
+      Base do nginx ausente ({{ nginx_base.results | rejectattr('stat.exists') | map(attribute='item') | join(', ') }}):
+      rode antes o playbooks/keycloak.yml de 01-cairbar-identity-provider.
+    quiet: true
+
+- name: Validar configuração de TLS
+  ansible.builtin.assert:
+    that:
+      - nginx_site_hostname | length > 0
+      - nginx_site_tls_mode in ['selfsigned', 'letsencrypt']
+      - nginx_site_tls_mode != 'letsencrypt' or nginx_site_letsencrypt_email | length > 0
+      - nginx_site_tls_mode != 'letsencrypt' or nginx_site_hostname is not match('^[0-9.:]+$')
+    fail_msg: "letsencrypt exige e-mail e um hostname DNS (não IP) para o site {{ nginx_site }}"
+    quiet: true
+
+# Usado em dev e como provisório até o certbot emitir o primeiro certificado.
+# Regerado quando o hostname muda.
+- name: Verificar hostname do certificado autoassinado
+  ansible.builtin.command:
+    cmd: openssl x509 -in {{ nginx_tls_dir }}/{{ nginx_site }}.crt -noout -ext subjectAltName
+  register: nginx_selfsigned_check
+  changed_when: false
+  failed_when: false
+
+- name: Gerar certificado autoassinado
+  ansible.builtin.command:
+    cmd: >-
+      openssl req -x509 -newkey rsa:3072 -nodes -sha256
+      -days {{ nginx_tls_selfsigned_days }}
+      -subj "/CN={{ nginx_site_hostname }}"
+      -addext "subjectAltName=DNS:{{ nginx_site_hostname }}"
+      -keyout {{ nginx_tls_dir }}/{{ nginx_site }}.key
+      -out {{ nginx_tls_dir }}/{{ nginx_site }}.crt
+  when: nginx_selfsigned_check.rc != 0 or ('DNS:' ~ nginx_site_hostname) not in nginx_selfsigned_check.stdout
+  notify: Recarregar nginx
+
+- name: Proteger chave privada autoassinada
+  ansible.builtin.file:
+    path: "{{ nginx_tls_dir }}/{{ nginx_site }}.key"
+    owner: root
+    group: root
+    mode: "0600"
+
+- name: Verificar certificado do Let's Encrypt
+  ansible.builtin.stat:
+    path: "/etc/letsencrypt/live/{{ nginx_site_hostname }}/fullchain.pem"
+  register: nginx_le_cert
+
+- name: Selecionar certificado em uso
+  ansible.builtin.set_fact:
+    nginx_tls_cert: "{{ nginx_le_cert.stat.path if nginx_le_cert.stat.exists else nginx_tls_dir ~ '/' ~ nginx_site ~ '.crt' }}"
+    nginx_tls_key: "{{ nginx_le_cert.stat.path | dirname ~ '/privkey.pem' if nginx_le_cert.stat.exists else nginx_tls_dir ~ '/' ~ nginx_site ~ '.key' }}"
+
+- name: Configurar site {{ nginx_site }} no nginx
+  ansible.builtin.template:
+    src: "../templates/nginx-{{ nginx_site }}.conf.j2"
+    dest: "/etc/nginx/sites-available/{{ nginx_site }}.conf"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Recarregar nginx
+
+- name: Habilitar site {{ nginx_site }}
+  ansible.builtin.file:
+    src: "/etc/nginx/sites-available/{{ nginx_site }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ nginx_site }}.conf"
+    state: link
+  notify: Recarregar nginx
+
+- name: Validar configuração do nginx
+  ansible.builtin.command:
+    cmd: nginx -t
+  changed_when: false
+
+- name: Aplicar configuração do nginx
+  ansible.builtin.meta: flush_handlers
+
+- name: Emitir certificado Let's Encrypt
+  when: nginx_site_tls_mode == 'letsencrypt'
+  block:
+    - name: Instalar certbot
+      ansible.builtin.apt:
+        name: certbot
+        state: present
+
+    # Um certificado por site (--cert-name = hostname), pelo webroot compartilhado.
+    - name: Solicitar certificado (webroot)
+      ansible.builtin.command:
+        cmd: >-
+          certbot certonly --webroot -w {{ nginx_acme_webroot }}
+          --cert-name {{ nginx_site_hostname }} -d {{ nginx_site_hostname }}
+          --email {{ nginx_site_letsencrypt_email }}
+          --agree-tos --non-interactive
+        creates: "/etc/letsencrypt/live/{{ nginx_site_hostname }}/fullchain.pem"
+
+    - name: Recarregar nginx após renovação
+      ansible.builtin.copy:
+        dest: /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+        content: |
+          #!/bin/sh
+          systemctl reload nginx
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Passar a usar o certificado do Let's Encrypt
+      ansible.builtin.set_fact:
+        nginx_tls_cert: "/etc/letsencrypt/live/{{ nginx_site_hostname }}/fullchain.pem"
+        nginx_tls_key: "/etc/letsencrypt/live/{{ nginx_site_hostname }}/privkey.pem"
+
+    - name: Reconfigurar site {{ nginx_site }} com o certificado do Let's Encrypt
+      ansible.builtin.template:
+        src: "../templates/nginx-{{ nginx_site }}.conf.j2"
+        dest: "/etc/nginx/sites-available/{{ nginx_site }}.conf"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Recarregar nginx
+
+    - name: Validar configuração final do nginx
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+
+    - name: Aplicar certificado do Let's Encrypt
+      ansible.builtin.meta: flush_handlers

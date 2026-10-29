@@ -1,0 +1,66 @@
+---
+# Publica o LiteLLM em https://<durvalai_hostname> no nginx da VM. O nginx é instalado
+# por 01-cairbar-identity-provider (playbooks/keycloak.yml), que precisa rodar antes:
+# aqui só entra o site do LiteLLM (sites-available/durvalai.conf) e o certificado dele.
+#   https://<durvalai_hostname><durvalai_mcp_path>     -> MCP servers (gateway MCP do LiteLLM)
+#   https://<durvalai_hostname><litellm_root_path>/ui  -> console admin do LiteLLM
+- name: Publicar LiteLLM no nginx
+  hosts: litellm
+  become: true
+  vars_files:
+    - ../global_vars/main.yml
+  vars:
+    nginx_site: durvalai
+    nginx_site_hostname: "{{ durvalai_hostname }}"
+    nginx_site_tls_mode: "{{ durvalai_tls_mode }}"
+    nginx_site_letsencrypt_email: "{{ durvalai_letsencrypt_email }}"
+
+  pre_tasks:
+    - name: Verificações iniciais
+      ansible.builtin.import_tasks: tasks/preflight.yml
+
+    - name: Validar endpoints
+      ansible.builtin.assert:
+        that:
+          - litellm_root_path is match('^/[A-Za-z0-9._-]+$')
+          - durvalai_mcp_path is match('^/[A-Za-z0-9._-]+$')
+          - durvalai_mcp_path != litellm_root_path
+        fail_msg: "litellm_root_path e durvalai_mcp_path precisam ser caminhos distintos de um nível (ex.: /litellm e /mcp)"
+        quiet: true
+
+  tasks:
+    - name: Configurar site e TLS
+      ansible.builtin.import_tasks: tasks/nginx-site.yml
+
+    # 502/504 indicam o LiteLLM fora do ar (rode litellm.yml).
+    - name: Verificar console admin pelo proxy
+      ansible.builtin.uri:
+        url: "https://127.0.0.1{{ litellm_root_path }}/health/liveliness"
+        headers:
+          Host: "{{ durvalai_hostname }}"
+        validate_certs: false
+        status_code: [200, 403]
+      changed_when: false
+
+    # Sem chave virtual o gateway responde 401; o que importa é chegar ao LiteLLM.
+    - name: Verificar endpoint MCP pelo proxy
+      ansible.builtin.uri:
+        url: "https://127.0.0.1{{ durvalai_mcp_path }}/"
+        method: POST
+        headers:
+          Host: "{{ durvalai_hostname }}"
+          Accept: "application/json, text/event-stream"
+        body_format: json
+        body:
+          jsonrpc: "2.0"
+          id: 1
+          method: ping
+        validate_certs: false
+        status_code: [200, 202, 400, 401, 403, 406]
+      changed_when: false
+
+  handlers:
+    - name: Recarregar nginx
+      ansible.builtin.systemd_service:
+        name: nginx
+        state: reloaded

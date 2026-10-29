@@ -1,0 +1,173 @@
+---
+# LiteLLM standalone: pip num virtualenv próprio + serviço systemd, escutando só em
+# {{ litellm_host }}:{{ litellm_port }}. Publicado pelo nginx (playbooks/nginx.yml).
+# O banco precisa existir antes (playbooks/postgresql.yml).
+- name: Instalar e configurar LiteLLM
+  hosts: litellm
+  become: true
+  vars_files:
+    - ../global_vars/main.yml
+    - ../global_vars/vault.yml
+  vars:
+    required_secrets:
+      - vault_postgresql_litellm_password
+      - vault_litellm_master_key
+      - vault_litellm_salt_key
+      - vault_litellm_ui_password
+
+  pre_tasks:
+    - name: Verificações iniciais
+      ansible.builtin.import_tasks: tasks/preflight.yml
+
+    - name: Validar master key do LiteLLM
+      ansible.builtin.assert:
+        that: vault_litellm_master_key is match('^sk-')
+        fail_msg: "vault_litellm_master_key precisa começar com sk-"
+        quiet: true
+
+  tasks:
+    - name: Instalar dependências do Python
+      ansible.builtin.apt:
+        name:
+          - python3-venv
+          - python3-pip
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Criar grupo do LiteLLM
+      ansible.builtin.group:
+        name: "{{ litellm_user }}"
+        system: true
+
+    - name: Criar usuário do LiteLLM
+      ansible.builtin.user:
+        name: "{{ litellm_user }}"
+        group: "{{ litellm_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: "{{ litellm_home }}"
+        create_home: false
+
+    - name: Criar HOME do LiteLLM
+      ansible.builtin.file:
+        path: "{{ litellm_home }}"
+        state: directory
+        owner: "{{ litellm_user }}"
+        group: "{{ litellm_user }}"
+        mode: "0750"
+
+    # Configuração e segredos pertencem ao root; o serviço só lê.
+    - name: Criar diretório de configuração
+      ansible.builtin.file:
+        path: "{{ litellm_config_dir }}"
+        state: directory
+        owner: root
+        group: "{{ litellm_user }}"
+        mode: "0750"
+
+    # O virtualenv pertence ao usuário do serviço: na partida o LiteLLM reescreve os
+    # arquivos da UI para o SERVER_ROOT_PATH e aplica as migrações do Prisma.
+    # O extra [proxy] não traz o cliente Prisma (fica em [extra-proxy], com dependências
+    # que não usamos): ele entra à parte, na faixa exigida pelo LiteLLM.
+    - name: Instalar LiteLLM {{ litellm_version }}
+      ansible.builtin.pip:
+        name:
+          - "litellm[proxy]=={{ litellm_version }}"
+          - "{{ litellm_prisma_requirement }}"
+        virtualenv: "{{ litellm_venv }}"
+        virtualenv_command: python3 -m venv
+      become_user: "{{ litellm_user }}"
+      environment:
+        HOME: "{{ litellm_home }}"
+      register: litellm_pip
+      notify: Reiniciar LiteLLM
+
+    - name: Verificar cliente Prisma gerado
+      ansible.builtin.command:
+        cmd: "{{ litellm_venv }}/bin/python -c 'from prisma import Prisma; Prisma()'"
+      become_user: "{{ litellm_user }}"
+      environment:
+        HOME: "{{ litellm_home }}"
+      register: litellm_prisma_check
+      changed_when: false
+      failed_when: false
+
+    - name: Gerar cliente Prisma
+      when: litellm_pip is changed or litellm_prisma_check.rc != 0
+      become_user: "{{ litellm_user }}"
+      environment:
+        HOME: "{{ litellm_home }}"
+      block:
+        - name: Localizar schema.prisma do LiteLLM
+          ansible.builtin.command:
+            cmd: >-
+              {{ litellm_venv }}/bin/python -c
+              'import litellm, os; print(os.path.join(os.path.dirname(litellm.__file__), "proxy", "schema.prisma"))'
+          register: litellm_prisma_schema
+          changed_when: false
+
+        - name: Executar prisma generate
+          ansible.builtin.command:
+            cmd: "{{ litellm_venv }}/bin/prisma generate --schema {{ litellm_prisma_schema.stdout }}"
+            chdir: "{{ litellm_home }}"
+          environment:
+            PATH: "{{ litellm_venv }}/bin:/usr/local/bin:/usr/bin:/bin"
+          changed_when: true
+          notify: Reiniciar LiteLLM
+
+    - name: Configurar variáveis de ambiente
+      ansible.builtin.template:
+        src: ../templates/litellm.env.j2
+        dest: "{{ litellm_config_dir }}/litellm.env"
+        owner: root
+        group: "{{ litellm_user }}"
+        mode: "0640"
+      no_log: true
+      notify: Reiniciar LiteLLM
+
+    - name: Configurar config.yaml
+      ansible.builtin.template:
+        src: ../templates/litellm-config.yaml.j2
+        dest: "{{ litellm_config_dir }}/config.yaml"
+        owner: root
+        group: "{{ litellm_user }}"
+        mode: "0640"
+      notify: Reiniciar LiteLLM
+
+    - name: Instalar serviço systemd
+      ansible.builtin.template:
+        src: ../templates/litellm.service.j2
+        dest: /etc/systemd/system/litellm.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reiniciar LiteLLM
+
+    - name: Habilitar e iniciar LiteLLM
+      ansible.builtin.systemd_service:
+        name: litellm
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Aplicar reinício pendente
+      ansible.builtin.meta: flush_handlers
+
+    # A primeira partida aplica as migrações do banco e pode levar alguns minutos.
+    - name: Aguardar LiteLLM responder
+      ansible.builtin.uri:
+        url: "http://{{ litellm_host }}:{{ litellm_port }}{{ litellm_root_path }}/health/liveliness"
+        status_code: 200
+      register: litellm_health
+      until: litellm_health.status == 200
+      retries: 40
+      delay: 10
+      changed_when: false
+
+  handlers:
+    - name: Reiniciar LiteLLM
+      ansible.builtin.systemd_service:
+        name: litellm
+        state: restarted
+        daemon_reload: true

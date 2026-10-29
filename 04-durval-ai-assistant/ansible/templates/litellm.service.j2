@@ -1,0 +1,24 @@
+# {{ ansible_managed }}
+[Unit]
+Description=LiteLLM Proxy {{ litellm_version }}
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={{ litellm_user }}
+Group={{ litellm_user }}
+WorkingDirectory={{ litellm_home }}
+Environment=HOME={{ litellm_home }}
+Environment=PATH={{ litellm_venv }}/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile={{ litellm_config_dir }}/litellm.env
+ExecStart={{ litellm_venv }}/bin/litellm --config {{ litellm_config_dir }}/config.yaml --host {{ litellm_host }} --port {{ litellm_port }} --num_workers {{ litellm_num_workers }}
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=600
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

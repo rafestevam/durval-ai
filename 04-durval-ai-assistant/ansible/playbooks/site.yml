@@ -1,0 +1,11 @@
+---
+# Stack completa do LiteLLM. O PostgreSQL e o nginx são da solução 01-cairbar-identity-provider,
+# que precisa rodar antes.
+- name: PostgreSQL
+  ansible.builtin.import_playbook: postgresql.yml
+
+- name: LiteLLM
+  ansible.builtin.import_playbook: litellm.yml
+
+- name: Site do LiteLLM no nginx
+  ansible.builtin.import_playbook: nginx.yml

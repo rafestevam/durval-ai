@@ -1,0 +1,13 @@
+---
+# Copie para global_vars/vault.yml, defina os segredos e criptografe:
+#   ansible-vault encrypt global_vars/vault.yml --vault-password-file .vault_pass
+# Evite aspas duplas e barras invertidas nos valores.
+vault_postgresql_litellm_password: "trocar-senha-litellm"
+# Chave de administração da API do LiteLLM (precisa começar com sk-).
+vault_litellm_master_key: "sk-trocar-master-key"
+# Criptografa as chaves de provedores gravadas no banco. Não altere depois de definida:
+# as credenciais já salvas ficariam ilegíveis.
+vault_litellm_salt_key: "sk-trocar-salt-key"
+# Senha de litellm_ui_username no console admin.
+vault_litellm_ui_password: "trocar-senha-console"
+vault_anthropic_api_key: ""

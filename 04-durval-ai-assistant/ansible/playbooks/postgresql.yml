@@ -1,0 +1,79 @@
+---
+# O PostgreSQL é instalado e configurado só pela solução 01-cairbar-identity-provider
+# (playbooks/postgresql.yml, que também faz o backup diário de todos os bancos).
+# Aqui só são criados o usuário, o banco e as regras de pg_hba.conf do LiteLLM.
+- name: Criar banco do LiteLLM no PostgreSQL compartilhado
+  hosts: postgresql
+  become: true
+  vars_files:
+    - ../global_vars/main.yml
+    - ../global_vars/vault.yml
+  vars:
+    required_secrets:
+      - vault_postgresql_litellm_password
+
+  pre_tasks:
+    - name: Verificações iniciais
+      ansible.builtin.import_tasks: tasks/preflight.yml
+
+    - name: Verificar instalação do PostgreSQL {{ postgresql_version }}
+      ansible.builtin.stat:
+        path: "{{ postgresql_conf_dir }}/pg_hba.conf"
+      register: postgresql_pg_hba_stat
+
+    - name: Exigir PostgreSQL instalado pela solução 01-cairbar-identity-provider
+      ansible.builtin.assert:
+        that: postgresql_pg_hba_stat.stat.exists
+        fail_msg: "PostgreSQL {{ postgresql_version }} não encontrado: rode antes o playbooks/postgresql.yml de 01-cairbar-identity-provider"
+        quiet: true
+
+  tasks:
+    - name: Liberar acesso das aplicações no pg_hba.conf
+      community.postgresql.postgresql_pg_hba:
+        dest: "{{ postgresql_conf_dir }}/pg_hba.conf"
+        contype: host
+        databases: "{{ item.0.name }}"
+        users: "{{ item.0.owner }}"
+        address: "{{ item.1 }}"
+        method: scram-sha-256
+        owner: postgres
+        group: postgres
+        mode: "0640"
+      loop: "{{ postgresql_databases | subelements('allowed_cidrs') }}"
+      loop_control:
+        label: "{{ item.0.name }} <- {{ item.1 }}"
+      notify: Recarregar PostgreSQL
+
+    - name: Aplicar alterações pendentes de configuração
+      ansible.builtin.meta: flush_handlers
+
+    - name: Criar usuários das aplicações
+      community.postgresql.postgresql_user:
+        name: "{{ item.owner }}"
+        password: "{{ item.password }}"
+        login_port: "{{ postgresql_port }}"
+      loop: "{{ postgresql_databases }}"
+      loop_control:
+        label: "{{ item.owner }}"
+      become_user: postgres
+      no_log: true
+
+    - name: Criar bancos das aplicações
+      community.postgresql.postgresql_db:
+        name: "{{ item.name }}"
+        owner: "{{ item.owner }}"
+        encoding: UTF-8
+        lc_collate: C.UTF-8
+        lc_ctype: C.UTF-8
+        template: template0
+        login_port: "{{ postgresql_port }}"
+      loop: "{{ postgresql_databases }}"
+      loop_control:
+        label: "{{ item.name }}"
+      become_user: postgres
+
+  handlers:
+    - name: Recarregar PostgreSQL
+      ansible.builtin.service:
+        name: postgresql
+        state: reloaded
